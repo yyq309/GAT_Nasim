@@ -24,11 +24,10 @@ except ImportError as e:
 from nasim.envs.utils import obs_to_graph
 
 
-# ======================================
+# ===========================
 # GAT Encoder
-# ======================================
+# ===========================
 class GATEncoder(nn.Module):
-    """图结构编码器"""
     def __init__(self, input_dim, gat_hidden=64, out_dim=64, gat_heads=4, dropout=0.1):
         super().__init__()
         self.gat1 = GATConv(input_dim, gat_hidden, heads=gat_heads, concat=True, dropout=dropout)
@@ -38,13 +37,13 @@ class GATEncoder(nn.Module):
         x, edge_index = data.x, data.edge_index
         x = F.relu(self.gat1(x, edge_index))
         x = F.relu(self.gat2(x, edge_index))
-        g = x.mean(dim=0, keepdim=True)  # 图平均池化
+        g = x.mean(dim=0, keepdim=True)
         return g.squeeze(0)
 
 
-# ======================================
+# ===========================
 # DQN 网络
-# ======================================
+# ===========================
 class DQN(nn.Module):
     def __init__(self, input_dim, hidden_sizes, num_actions):
         super().__init__()
@@ -61,32 +60,36 @@ class DQN(nn.Module):
         return self.model(x)
 
 
-# ======================================
-# Replay Memory
-# ======================================
+# ===========================
+# Replay Memory (序列化)
+# ===========================
 class ReplayMemory:
-    def __init__(self, capacity, s_dim, device="cpu"):
+    def __init__(self, capacity, seq_len, feat_dim, device="cpu"):
         self.capacity = capacity
+        self.seq_len = seq_len
+        self.feat_dim = feat_dim
         self.device = device
         self.ptr = 0
         self.size = 0
-        self.s_buf = np.zeros((capacity, s_dim), dtype=np.float32)
+
+        self.s_buf = np.zeros((capacity, seq_len, feat_dim), dtype=np.float32)
         self.a_buf = np.zeros((capacity, 1), dtype=np.int64)
-        self.next_s_buf = np.zeros((capacity, s_dim), dtype=np.float32)
+        self.next_s_buf = np.zeros((capacity, seq_len, feat_dim), dtype=np.float32)
         self.r_buf = np.zeros(capacity, dtype=np.float32)
         self.done_buf = np.zeros(capacity, dtype=np.float32)
 
-    def store(self, s, a, next_s, r, done):
-        self.s_buf[self.ptr] = s
+    def store(self, seq_s, a, seq_next_s, r, done):
+        self.s_buf[self.ptr] = seq_s
         self.a_buf[self.ptr] = a
-        self.next_s_buf[self.ptr] = next_s
+        self.next_s_buf[self.ptr] = seq_next_s
         self.r_buf[self.ptr] = r
         self.done_buf[self.ptr] = done
+
         self.ptr = (self.ptr + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
     def sample_batch(self, batch_size):
-        idxs = np.random.choice(self.size, batch_size)
+        idxs = np.random.randint(0, self.size - self.seq_len, batch_size)
         s = torch.tensor(self.s_buf[idxs], device=self.device)
         a = torch.tensor(self.a_buf[idxs], device=self.device, dtype=torch.long)
         next_s = torch.tensor(self.next_s_buf[idxs], device=self.device)
@@ -95,27 +98,27 @@ class ReplayMemory:
         return s, a, next_s, r, d
 
 
-# ======================================
-# GAT-RNN-DQN Agent
-# ======================================
+# ===========================
+# GAT-RNN-DQN 智能体
+# ===========================
 class GATRNNDQNAgent:
     def __init__(self, env,
                  lr=1e-3,
                  gamma=0.97,
-                 batch_size=54,
+                 batch_size=32,
                  replay_size=10000,
-                 hidden_sizes=[128, 128],
-                 gat_hidden=97,
+                 hidden_sizes=[256, 256],
+                 gat_hidden=128,
                  gat_out_dim=64,
-                 rnn_hidden_dim=112,
+                 rnn_hidden_dim=32,
                  rnn_num_layers=1,
-                 rnn_type="LSTM",
+                 rnn_type="GRU",
                  gat_heads=4,
-                 gat_dropout=0.3130828152682149,
+                 gat_dropout=0.3,
                  rnn_dropout=0.08771617264038689,
-                 exploration_steps=10000,
-                 final_epsilon=0.06961374261255864,
-                 target_update_freq=818,
+                 seq_len=4,
+                 final_epsilon=0.05,
+                 target_update_freq=500,
                  training_steps=20000,
                  seed=0,
                  device=None,
@@ -138,7 +141,7 @@ class GATRNNDQNAgent:
         self.training_steps = training_steps
         self.target_update_freq = target_update_freq
         self.steps_done = 0
-
+        self.seq_len = seq_len
         self.rnn_hidden_dim = rnn_hidden_dim
         self.rnn_num_layers = rnn_num_layers
 
@@ -172,154 +175,184 @@ class GATRNNDQNAgent:
         )
         self.loss_fn = nn.SmoothL1Loss()
 
-        self.replay = ReplayMemory(replay_size, rnn_hidden_dim, self.device)
+        # Replay Memory
+        self.replay = ReplayMemory(replay_size, seq_len, gat_out_dim, self.device)
+
         self.final_epsilon = final_epsilon
-        self.epsilon_schedule = np.linspace(1.0, final_epsilon, exploration_steps)
+        self.epsilon_schedule = np.linspace(1.0, final_epsilon, training_steps)
         self.logger = SummaryWriter()
 
+        # 当前序列缓存
+        self.seq_buffer = []
+
+    # ------------------------------
+    # 工具函数
+    # ------------------------------
     def get_epsilon(self):
         idx = min(self.steps_done, len(self.epsilon_schedule) - 1)
         return self.epsilon_schedule[idx]
 
-    def encode_obs(self, obs, hidden):
-        """GAT + RNN编码，确保 hidden 为 3D"""
+    def encode_obs(self, obs):
         obs_array = np.array(obs)
         num_nodes = len(self.env.network.hosts) + 1
         feature_dim = int(obs_array.size / num_nodes)
         obs_array = obs_array.reshape(num_nodes, feature_dim)
 
         graph = obs_to_graph(obs_array, self.env.network).to(self.device)
-        gat_emb = self.encoder(graph).unsqueeze(0).unsqueeze(0)  # [batch=1, seq=1, feat]
-        
-        # 确保 hidden 是 3D
-        if isinstance(self.rnn, nn.LSTM):
-            h, c = hidden
-            if h.dim() == 2:
-                h = h.unsqueeze(0)
-            if c.dim() == 2:
-                c = c.unsqueeze(0)
-            rnn_out, hidden = self.rnn(gat_emb, (h, c))
-        else:
-            if hidden.dim() == 2:
-                hidden = hidden.unsqueeze(0)
-            rnn_out, hidden = self.rnn(gat_emb, hidden)
+        gat_emb = self.encoder(graph)  # [gat_out_dim]
+        return gat_emb
 
-        return rnn_out.squeeze(0).squeeze(0), hidden
-
-    def get_egreedy_action(self, obs, epsilon, hidden):
-        state_vec, hidden = self.encode_obs(obs, hidden)
+    def get_egreedy_action(self, rnn_out, epsilon):
         with torch.no_grad():
-            q_values = self.policy_net(state_vec.unsqueeze(0))
+            q_values = self.policy_net(rnn_out)
         if random.random() > epsilon:
-            return q_values.argmax(dim=1).item(), hidden
-        return random.randint(0, self.num_actions - 1), hidden
+            return q_values.argmax(dim=1).item()
+        return random.randint(0, self.num_actions - 1)
 
+    # ------------------------------
+    # 训练优化
+    # ------------------------------
     def optimize(self):
         if self.replay.size < self.batch_size:
             return 0, 0
+
         s, a, next_s, r, d = self.replay.sample_batch(self.batch_size)
-        q_vals = self.policy_net(s).gather(1, a).squeeze()
+
+        # RNN 前向传播
+        rnn_out, _ = self.rnn(s)  # [B, seq_len, rnn_hidden]
+        rnn_last = rnn_out[:, -1, :]
+        q_vals = self.policy_net(rnn_last).gather(1, a).squeeze()
+
         with torch.no_grad():
-            target_q = r + self.gamma * (1 - d) * self.target_net(next_s).max(1)[0]
+            rnn_next, _ = self.rnn(next_s)
+            rnn_next_last = rnn_next[:, -1, :]
+            target_q = r + self.gamma * (1 - d) * self.target_net(rnn_next_last).max(1)[0]
+
         loss = self.loss_fn(q_vals, target_q)
         self.optimizer.zero_grad()
         loss.backward()
+        nn.utils.clip_grad_norm_(self.encoder.parameters(), 1.0)
         self.optimizer.step()
-        if self.steps_done % self.target_update_freq == 0:
-            self.target_net.load_state_dict(self.policy_net.state_dict())
+
+        for target_param, param in zip(self.target_net.parameters(), self.policy_net.parameters()):
+            target_param.data.copy_(0.995 * target_param.data + 0.005 * param.data)
+
         return loss.item(), q_vals.mean().item()
 
+    # ------------------------------
+    # 训练一个 episode
+    # ------------------------------
     def run_train_episode(self, step_limit):
         obs, _ = self.env.reset()
-        # 初始化 RNN 隐状态
-        if isinstance(self.rnn, nn.LSTM):
-            hidden = (
-                torch.zeros(self.rnn_num_layers, 1, self.rnn_hidden_dim, device=self.device),
-                torch.zeros(self.rnn_num_layers, 1, self.rnn_hidden_dim, device=self.device),
-            )
-        else:
-            hidden = torch.zeros(self.rnn_num_layers, 1, self.rnn_hidden_dim, device=self.device)
+        self.seq_buffer = []
+        
+        # 初始化 RNN hidden
+        hidden = None 
 
         done, total_reward, steps = False, 0, 0
         while not done and steps < step_limit:
             epsilon = self.get_epsilon()
-            action, hidden = self.get_egreedy_action(obs, epsilon, hidden)
+            gat_emb = self.encode_obs(obs)
+
+            # 更新序列缓存
+            self.seq_buffer.append(gat_emb.detach().cpu().numpy())
+            if len(self.seq_buffer) > self.seq_len:
+                self.seq_buffer.pop(0)
+
+            # 构建输入序列
+            seq_input = np.array(self.seq_buffer)
+            if len(seq_input) < self.seq_len:
+                pad = np.zeros((self.seq_len - len(seq_input), gat_emb.shape[0]), dtype=np.float32)
+                seq_input = np.vstack([pad, seq_input])
+
+            seq_tensor = torch.tensor(seq_input, dtype=torch.float32, device=self.device).unsqueeze(0)
+            rnn_out, hidden = self.rnn(seq_tensor, hidden)
+            rnn_last = rnn_out[:, -1, :]
+
+            action = self.get_egreedy_action(rnn_last, epsilon)
             next_obs, reward, done, _, _ = self.env.step(action)
-            s_vec, _ = self.encode_obs(obs, hidden)
-            next_vec, _ = self.encode_obs(next_obs, hidden)
 
-            # detach 避免梯度追踪
-            self.replay.store(
-                s_vec.detach().cpu().numpy(),
-                [action],
-                next_vec.detach().cpu().numpy(),
-                float(reward),
-                float(done)
-            )
+            # 构建 next_seq
+            next_seq_buffer = self.seq_buffer.copy()
+            next_gat_emb = self.encode_obs(next_obs)
+            next_seq_buffer.append(next_gat_emb.detach().cpu().numpy())
+            if len(next_seq_buffer) > self.seq_len:
+                next_seq_buffer.pop(0)
+            next_seq_input = np.array(next_seq_buffer)
+            if len(next_seq_input) < self.seq_len:
+                pad = np.zeros((self.seq_len - len(next_seq_input), gat_emb.shape[0]), dtype=np.float32)
+                next_seq_input = np.vstack([pad, next_seq_input])
 
+            self.replay.store(seq_input, [action], next_seq_input, float(reward), float(done))
             self.optimize()
+
             total_reward += reward
             obs = next_obs
             steps += 1
             self.steps_done += 1
+
         return total_reward, steps, self.env.goal_reached()
 
+    # ------------------------------
+    # 训练主循环
+    # ------------------------------
     def train(self):
         num_episodes = 0
         while self.steps_done < self.training_steps:
             ep_ret, ep_steps, goal = self.run_train_episode(self.training_steps - self.steps_done)
             num_episodes += 1
-            
+
             self.logger.add_scalar("episode", num_episodes, self.steps_done)
             self.logger.add_scalar("epsilon", self.get_epsilon(), self.steps_done)
             self.logger.add_scalar("episode_return", ep_ret, self.steps_done)
             self.logger.add_scalar("episode_steps", ep_steps, self.steps_done)
             self.logger.add_scalar("episode_goal_reached", int(goal), self.steps_done)
-            
+
             if num_episodes % 10 == 0:
                 print(f"Episode {num_episodes}: steps={self.steps_done}, return={ep_ret}, goal={goal}")
         self.logger.close()
 
+    # ------------------------------
+    # 评估
+    # ------------------------------
     def run_eval_episode(self, env=None, render=False, eval_epsilon=0.05):
         if env is None:
             env = self.env
         obs, _ = env.reset()
+        self.seq_buffer = []
+        
+        hidden = None
+
         done, steps, ep_ret = False, 0, 0
-
-        # 初始化 RNN 隐状态
-        if isinstance(self.rnn, nn.LSTM):
-            h_rnn = (
-                torch.zeros(self.rnn_num_layers, 1, self.rnn_hidden_dim, device=self.device),
-                torch.zeros(self.rnn_num_layers, 1, self.rnn_hidden_dim, device=self.device),
-            )
-        else:
-            h_rnn = torch.zeros(self.rnn_num_layers, 1, self.rnn_hidden_dim, device=self.device)
-
         while not done:
-            obs_array = np.array(obs)
-            num_nodes = len(env.network.hosts) + 1
-            feature_dim = int(obs_array.size / num_nodes)
-            obs_array = obs_array.reshape(num_nodes, feature_dim)
-            graph = obs_to_graph(obs_array, env.network).to(self.device)
+            gat_emb = self.encode_obs(obs)
+            self.seq_buffer.append(gat_emb.detach().cpu().numpy())
+            if len(self.seq_buffer) > self.seq_len:
+                self.seq_buffer.pop(0)
 
-            with torch.no_grad():
-                g_emb = self.encoder(graph).unsqueeze(0).unsqueeze(0)
-                if isinstance(self.rnn, nn.LSTM):
-                    rnn_out, h_rnn = self.rnn(g_emb, h_rnn)
-                else:
-                    rnn_out, h_rnn = self.rnn(g_emb, h_rnn)
+            seq_input = np.array(self.seq_buffer)
+            if len(seq_input) < self.seq_len:
+                pad = np.zeros((self.seq_len - len(seq_input), gat_emb.shape[0]), dtype=np.float32)
+                seq_input = np.vstack([pad, seq_input])
 
-                q_values = self.policy_net(rnn_out.squeeze(0))
-                if random.random() > eval_epsilon:
-                    a = q_values.argmax(dim=1).item()
-                else:
-                    a = random.randint(0, self.num_actions - 1)
+            seq_tensor = torch.tensor(seq_input, dtype=torch.float32, device=self.device).unsqueeze(0)
+            rnn_out, hidden = self.rnn(seq_tensor, hidden)
+            rnn_last = rnn_out[:, -1, :]
 
-            obs, r, done, _, _ = env.step(a)
+            # epsilon-greedy
+            if random.random() > eval_epsilon:
+                with torch.no_grad():
+                    q_values = self.policy_net(rnn_last)
+                    action = q_values.argmax(dim=1).item()
+            else:
+                action = random.randint(0, self.num_actions - 1)
+
+            obs, r, done, _, _ = env.step(action)
             ep_ret += r
             steps += 1
             if render:
                 env.render()
+
         return ep_ret, steps, env.goal_reached()
 
 

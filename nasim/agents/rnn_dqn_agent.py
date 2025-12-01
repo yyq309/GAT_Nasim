@@ -256,6 +256,7 @@ class SequenceRNNDQNAgent:
         num_eps = 0
         while self.steps_done < self.training_steps:
             ep_ret, ep_steps, goal = self.run_train_episode(self.training_steps - self.steps_done)
+            loss, q_mean = self.optimize()
             num_eps += 1
 
             self.logger.add_scalar("episode", num_eps, self.steps_done)
@@ -263,6 +264,9 @@ class SequenceRNNDQNAgent:
             self.logger.add_scalar("episode_return", ep_ret, self.steps_done)
             self.logger.add_scalar("episode_steps", ep_steps, self.steps_done)
             self.logger.add_scalar("episode_goal_reached", int(goal), self.steps_done)
+            
+            self.logger.add_scalar("loss", loss, self.steps_done)
+            self.logger.add_scalar("q_value_mean", q_mean, self.steps_done)
 
             if num_eps % 10 == 0:
                 print(f"Ep {num_eps} | Steps={self.steps_done} | Ret={ep_ret:.1f} | Goal={goal}")
@@ -308,36 +312,9 @@ if __name__ == "__main__":
     parser.add_argument("--training_steps", type=int, default=20000)
     args = parser.parse_args()
 
-    print(f"✅ 启动训练环境: {args.env_name}")
     env = nasim.make_benchmark(args.env_name, 0, fully_obs=False, flat_actions=True, flat_obs=True)
 
     kwargs = vars(args)
-    del kwargs["env_name"]
     agent = SequenceRNNDQNAgent(env, **kwargs)
-
-    try:
-        agent.train()
-        print("训练完成，开始评估...")
-        ret, steps, goal = agent.run_eval_episode(render=False)
-        print(f"评估结果: Return={ret:.1f}, Steps={steps}, Goal={goal}")
-
-    except KeyboardInterrupt:
-        print("\n 手动中断训练，正在清理资源...")
-
-    finally:
-        # === 安全退出区 ===
-        print("正在释放资源...")
-        try:
-            env.close()
-        except Exception:
-            pass
-
-        try:
-            agent.logger.close()
-        except Exception:
-            pass
-
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        print("资源清理完成，程序即将退出。")
+    agent.train()
+    agent.run_eval_episode(render=args.render_eval)

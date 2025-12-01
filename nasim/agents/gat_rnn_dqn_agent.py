@@ -300,6 +300,7 @@ class GATRNNDQNAgent:
         num_episodes = 0
         while self.steps_done < self.training_steps:
             ep_ret, ep_steps, goal = self.run_train_episode(self.training_steps - self.steps_done)
+            loss, q_mean = self.optimize()
             num_episodes += 1
 
             self.logger.add_scalar("episode", num_episodes, self.steps_done)
@@ -307,6 +308,9 @@ class GATRNNDQNAgent:
             self.logger.add_scalar("episode_return", ep_ret, self.steps_done)
             self.logger.add_scalar("episode_steps", ep_steps, self.steps_done)
             self.logger.add_scalar("episode_goal_reached", int(goal), self.steps_done)
+            
+            self.logger.add_scalar("loss", loss, self.steps_done)
+            self.logger.add_scalar("q_value_mean", q_mean, self.steps_done)
 
             if num_episodes % 10 == 0:
                 print(f"Episode {num_episodes}: steps={self.steps_done}, return={ep_ret}, goal={goal}")

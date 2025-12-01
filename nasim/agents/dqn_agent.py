@@ -235,6 +235,7 @@ class DQNAgent:
         while self.steps_done < self.training_steps:
             ep_results = self.run_train_episode(training_steps_remaining)
             ep_return, ep_steps, goal = ep_results
+            loss, q_mean = self.optimize()
             num_episodes += 1
             training_steps_remaining -= ep_steps
 
@@ -251,6 +252,8 @@ class DQNAgent:
             self.logger.add_scalar(
                 "episode_goal_reached", int(goal), self.steps_done
             )
+            self.logger.add_scalar("loss", loss, self.steps_done)
+            self.logger.add_scalar("q_value_mean", q_mean, self.steps_done)
 
             if num_episodes % 10 == 0 and self.verbose:
                 print(f"\nEpisode {num_episodes}:")

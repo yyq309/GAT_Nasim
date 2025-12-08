@@ -368,7 +368,7 @@ if __name__ == "__main__":
     parser.add_argument("--render_eval", action="store_true")
     args = parser.parse_args()
 
-    env = nasim.make_benchmark(args.env_name, seed=0, fully_obs=True, flat_actions=True, flat_obs=True)
+    env = nasim.make_benchmark(args.env_name, seed=0, fully_obs=False, flat_actions=True, flat_obs=False)
     agent = GATRNNDQNAgent(env, training_steps=args.training_steps)
     agent.train()
     agent.run_eval_episode(render=args.render_eval)

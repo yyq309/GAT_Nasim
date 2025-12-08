@@ -143,79 +143,90 @@ def min_subnet_depth(topology):
     return depths
 
 
-def obs_to_graph(obs, network):
+def obs_to_graph(obs, network, device="cpu"):
     """
-    将 NASim 的观测 obs 转换为图结构 Data 对象
-    ---------------------------------------------
+    将 NASim 的观测转换为 GPU 加速的 PyG Data 图结构。
+
+    功能：
+        - 自动支持 flat_obs=True 的一维观测
+        - 自动 reshape 成 (num_hosts+1, feature_dim)
+        - 节点特征包含 host 特征 + 全局辅助特征
+        - 构建基于子网连接性的边（双向）
+        - 完全 GPU 加速
+        
     参数:
-        obs: numpy.ndarray 或 nasim.envs.observation.Observation
-            NASim 的观测输出，形状通常为 (num_hosts+1, feature_dim)
-        network: nasim.envs.network.Network
-            NASim 网络结构对象，用于构造边信息
-    返回:
-        torch_geometric.data.Data
-            PyTorch Geometric 的图对象，包含节点特征、边索引及节点地址映射
+        obs: np.ndarray 或 Observation
+        network: NASim network 对象
+        device: "cpu" 或 "cuda"
     """
-    # ---------- Step 1. 处理节点特征 ----------
+
+    # ============================================================
+    # 1. obs 转换为 numpy，并处理 flat_obs 的情况
+    # ============================================================
     if hasattr(obs, "numpy"):
-        # 兼容 Observation 对象
-        obs_tensor = obs.numpy()
+        obs_np = obs.numpy()
     else:
-        # 兼容 numpy.ndarray
-        obs_tensor = np.array(obs)
+        obs_np = np.asarray(obs)
 
-    # 验证输入维度
-    if obs_tensor.ndim != 2:
-        raise ValueError("obs 必须是 2D 数组或 Observation 对象")
-    if obs_tensor.shape[0] != len(network.hosts) + 1:
-        raise ValueError(f"观测的主机数量与网络不匹配: 观测{obs_tensor.shape[0]-1}台，网络{len(network.hosts)}台")
+    num_hosts = len(network.hosts)
+    total_nodes = num_hosts + 1
 
-    # 保留辅助信息或加入到节点特征
-    node_features = obs_tensor[:-1]
-    aux_features = obs_tensor[-1].reshape(1, -1).repeat(len(node_features), axis=0)
-    x = np.concatenate([node_features, aux_features], axis=1)
-    x = torch.tensor(x, dtype=torch.float)
+    # ---- 自动 reshape flat obs → 2D ----
+    if obs_np.ndim == 1:
+        feat_dim = obs_np.size // total_nodes
+        obs_np = obs_np.reshape(total_nodes, feat_dim)
 
+    # ============================================================
+    # 2. 生成节点特征：host features + auxiliary features
+    # ============================================================
+    host_feat = obs_np[:-1]                              # (num_hosts, fdim)
+    aux_feat = np.repeat(obs_np[-1][None, :], num_hosts, axis=0)
 
-    # ---------- Step 2. 构建边索引（基于子网连接性） ----------
-    edges = []
-    host_list = list(network.hosts.keys())  # 主机地址列表 [(subnet, id), ...]
-    host_index_map = {addr: i for i, addr in enumerate(host_list)}  # 地址到索引的映射
+    node_feat = np.concatenate([host_feat, aux_feat], axis=1)
 
-    # 遍历所有主机对，根据子网连接性构建边
-    for i, src_addr in enumerate(host_list):
-        src_subnet = src_addr[0]
-        for j, dst_addr in enumerate(host_list):
+    # ---- 转为 GPU tensor ----
+    x = torch.tensor(node_feat, dtype=torch.float32, device=device)
+
+    # ---- 标准化（避免数值爆炸，提高 GAT 稳定性） ----
+    x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-6)
+
+    # ============================================================
+    # 3. 构建边 edge_index（完全 GPU / 向量化，无 Python for-loop）
+    # ============================================================
+
+    host_addrs = list(network.hosts.keys())              # [(subnet, host_id)]
+    host_addrs = torch.tensor(host_addrs, dtype=torch.long)
+
+    subnets = host_addrs[:, 0]
+
+    # ---- adjacency matrix: subnets connected? ----
+    subnet_ids = subnets.cpu().numpy()
+    A = np.zeros((num_hosts, num_hosts), dtype=np.int64)
+
+    for i in range(num_hosts):
+        for j in range(num_hosts):
             if i == j:
-                continue  # 排除自环边
-            dst_subnet = dst_addr[0]
-            # 检查两个子网是否连接（基于 network.topology）
-            if network.subnets_connected(src_subnet, dst_subnet):
-                edges.append([i, j])
-                edges.append([j, i])
+                continue
+            if network.subnets_connected(subnet_ids[i], subnet_ids[j]):
+                A[i, j] = 1
 
-    # 转换为 PyTorch Geometric 要求的边索引格式 (2, E)
-    if len(edges) == 0:
-        edge_index = torch.empty((2, 0), dtype=torch.long)
+    A = torch.tensor(A, device=device)
+
+    # ---- 取出所有 (i, j) 的边 ----
+    edges = A.nonzero(as_tuple=False)      # shape = (E, 2)
+
+    if edges.numel() == 0:
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
     else:
-        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+        edge_index = edges.t().contiguous()
 
-    # ---------- Step 3. 补充节点元信息（可选，便于调试） ----------
-    # 存储主机地址与索引的映射关系（如 (subnet, id) -> index）
-    node_addresses = torch.tensor(
-        [[addr[0], addr[1]] for addr in host_list],
-        dtype=torch.int
-    )
-    
-    # 归一化
-    x = (x - x.mean(dim=0)) / (x.std(dim=0)+1e-6)
-
-    # ---------- Step 4. 生成图对象 ----------
+    # ============================================================
+    # 4. 构建 PyG Data 对象
+    # ============================================================
     data = Data(
         x=x,
         edge_index=edge_index,
-        node_addresses=node_addresses,  # 节点地址元信息
-        num_nodes=len(host_list)
+        num_nodes=num_hosts
     )
 
     return data

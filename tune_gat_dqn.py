@@ -1,7 +1,7 @@
 import optuna
 import nasim
 import torch
-from nasim.agents.gat_dqn_agent import GATDQNAgent
+from nasim.agents.reward_gat_dqn_agent import GATDQNAgent
 from statistics import mean
 
 # ==========================
@@ -9,7 +9,7 @@ from statistics import mean
 # ==========================
 def objective(trial):
     # 创建 NASim 环境
-    env = nasim.make_benchmark("tiny", fully_obs=True, flat_actions=True, flat_obs=True)
+    env = nasim.make_benchmark("medium", fully_obs=True, flat_actions=True, flat_obs=True)
     
     # ==========================
     # 📦 定义待搜索参数空间
@@ -38,7 +38,7 @@ def objective(trial):
         target_update_freq=target_update_freq,
         exploration_steps=exploration_steps,
         final_epsilon=final_epsilon,
-        training_steps=10000,
+        training_steps=100000,
         verbose=False,
         device="cuda" if torch.cuda.is_available() else "cpu"
     )

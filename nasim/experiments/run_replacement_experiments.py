@@ -9,6 +9,33 @@ import torch
 from nasim.agents.HippocampusAgent import HippocampusAgent
 
 
+def setup_gpu_device():
+    """配置 GPU 设备，优先使用第二块显卡（GPU 1），兼容单 GPU/无 GPU 场景"""
+    # 检查可用 GPU 数量
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        if gpu_count >= 2:
+            # 优先使用第二块显卡（索引为 1，第一块是 0）
+            device = torch.device("cuda:1")
+            torch.cuda.set_device(device)  # 设置全局默认 GPU
+            print(f"使用第二块显卡 (cuda:1)，GPU 名称: {torch.cuda.get_device_name(1)}")
+        elif gpu_count == 1:
+            # 只有一块显卡时使用 GPU 0
+            device = torch.device("cuda:0")
+            torch.cuda.set_device(device)
+            print(f"仅检测到一块显卡，使用 cuda:0，GPU 名称: {torch.cuda.get_device_name(0)}")
+        else:
+            device = torch.device("cpu")
+            print("未检测到 GPU，使用 CPU 运行")
+    else:
+        device = torch.device("cpu")
+        print("CUDA 不可用，使用 CPU 运行")
+    return device
+
+# 初始化 GPU 设备（程序启动时立即执行）
+DEVICE = setup_gpu_device()
+
+
 # ===============================================
 # 自动创建目录
 # ===============================================
@@ -60,7 +87,7 @@ ENV_CONFIGS = {
 
 
 # ===============================================
-# 单次实验（适配环境专属奖励函数 + 精细化进度条）
+# 单次实验（适配环境专属奖励函数 + 精细化进度条 + GPU 适配）
 # ===============================================
 def run_one_experiment(env_name, att_type, rnn_type, seed, base_dir):
     # 保存路径： replacement_experiment_results/env/att_rnn/seedX
@@ -103,6 +130,11 @@ def run_one_experiment(env_name, att_type, rnn_type, seed, base_dir):
         info_gain_bonus=reward_config["info_gain_bonus"]
     )
 
+    # 核心改动2：将 agent 的模型强制移到指定 GPU（兜底保障）
+    if hasattr(agent, 'model') and torch.cuda.is_available():
+        agent.model = agent.model.to(DEVICE)
+        print(f"将 {att_type}+{rnn_type} 模型移到 {DEVICE}")
+
     # 训练进度条（增加描述信息，展示奖励配置）
     pbar_desc = (
         f"{env_name.upper()}-{att_type.upper()}-{rnn_type.upper()}-seed{seed} | "
@@ -135,7 +167,8 @@ def run_one_experiment(env_name, att_type, rnn_type, seed, base_dir):
             "ep": agent.episodes,
             "last_ret": f"{ep_ret:.1f}",
             "success": f"{int(goal)}",
-            "eps": f"{agent.epsilon():.3f}"
+            "eps": f"{agent.epsilon():.3f}",
+            "gpu": DEVICE  # 新增：进度条展示当前使用的 GPU/CPU
         })
 
     pbar.close()
@@ -180,13 +213,16 @@ def run_one_experiment(env_name, att_type, rnn_type, seed, base_dir):
     # 计算评估指标并打印
     avg_return = np.mean(eval_stats["returns"])
     success_rate = np.mean(eval_stats["goals"])
-    print(f"\n[Done] {save_dir} | AvgReturn={avg_return:.2f} | SuccessRate={success_rate:.2f}")
+    print(f"\n[Done] {save_dir} | AvgReturn={avg_return:.2f} | SuccessRate={success_rate:.2f} | GPU={DEVICE}")
 
 
 # ===============================================
 # 主函数——依次运行所有可替换性实验（优化全局进度条）
 # ===============================================
 def main():
+    # 核心改动3：启动时打印 GPU 信息（确认设备）
+    print(f"\n 实验启动 - 使用设备: {DEVICE}")
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--envs", nargs="+", default=["small", "medium"])
     parser.add_argument("--save-dir", type=str, default="replacement_results")
@@ -242,11 +278,13 @@ def main():
                     overall_pbar.set_postfix({
                         "current_env": env_name,
                         "current_model": f"{att_type}+{rnn_type}",
-                        "current_seed": seed
+                        "current_seed": seed,
+                        "gpu": DEVICE  # 新增：展示当前使用的 GPU
                     })
 
     overall_pbar.close()
     print(f"\nAll experiments completed! Results saved to {base_dir}")
+    print(f"本次实验使用设备: {DEVICE}")
 
 
 if __name__ == "__main__":

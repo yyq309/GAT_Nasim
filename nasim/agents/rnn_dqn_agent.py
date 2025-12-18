@@ -310,11 +310,22 @@ if __name__ == "__main__":
     parser.add_argument("--rnn_layers", type=int, default=1)
     parser.add_argument("--rnn_dropout", type=float, default=0.1)
     parser.add_argument("--training_steps", type=int, default=20000)
+    parser.add_argument("--seed", type=int, default=0,help="(default=0)")
+    parser.add_argument("--render_eval", action="store_true", default=False, help="Whether to render evaluation episode")
     args = parser.parse_args()
 
-    env = nasim.make_benchmark(args.env_name, 0, fully_obs=False, flat_actions=True, flat_obs=True)
+    env = nasim.make_benchmark(args.env_name, args.seed, fully_obs=False, flat_actions=True, flat_obs=True)
 
-    kwargs = vars(args)
-    agent = SequenceRNNDQNAgent(env, **kwargs)
+    # 修复：过滤掉 Agent __init__ 不接收的参数（如 env_name、render_eval）
+    agent_kwargs = {
+        "seq_len": args.seq_len,
+        "rnn_type": args.rnn_type,
+        "rnn_hidden_dim": args.rnn_hidden_dim,
+        "rnn_layers": args.rnn_layers,
+        "rnn_dropout": args.rnn_dropout,
+        "training_steps": args.training_steps
+    }
+    # 实例化 Agent 时只传入有效参数
+    agent = SequenceRNNDQNAgent(env, **agent_kwargs)
     agent.train()
     agent.run_eval_episode(render=args.render_eval)

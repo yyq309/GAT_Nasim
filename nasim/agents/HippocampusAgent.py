@@ -1,5 +1,5 @@
 """
-Hippocampus-Inspired Modular Agent for NASim (适配批量自动化脚本+独立运行)
+Hippocampus-Inspired Modular Agent for NASim
 ---------------------------------------------------------------------
 DG  = Attention Encoder (GATv2 / VectorAttention)
 CA3 = Temporal Memory   (GRU / LSTM)
@@ -192,7 +192,7 @@ class CA1ValueHead(nn.Module):
 
 
 # -------------------------
-# Replay Buffer (GPU-friendly)
+# Replay Buffer 
 # -------------------------
 class ReplayBuffer:
     def __init__(self, capacity: int, seq_len: int, feat_dim: int, device: torch.device):
@@ -231,6 +231,33 @@ class ReplayBuffer:
 
 
 # -------------------------
+# 核心改动1：新增设备选择函数（优先cuda:1）
+# -------------------------
+def get_target_device(manual_device: Optional[str] = None) -> torch.device:
+    """
+    优先选择第二块GPU（cuda:1），兼容手动指定/单GPU/无GPU场景
+    :param manual_device: 手动指定的设备（如 "cuda:0", "cpu"）
+    :return: 最终使用的设备
+    """
+    # 手动指定设备时优先使用
+    if manual_device is not None:
+        return torch.device(manual_device)
+    
+    # 自动选择：优先cuda:1，其次cuda:0，最后cpu
+    if torch.cuda.is_available():
+        if torch.cuda.device_count() >= 2:
+            device = torch.device("cuda:1")
+            print(f"自动选择第二块显卡: {torch.cuda.get_device_name(1)} (cuda:1)")
+        else:
+            device = torch.device("cuda:0")
+            print(f"仅检测到1块显卡，使用: {torch.cuda.get_device_name(0)} (cuda:0)")
+    else:
+        device = torch.device("cpu")
+        print("无可用GPU，使用CPU")
+    return device
+
+
+# -------------------------
 # Hippocampus Agent (精简版，适配批量脚本+独立运行)
 # -------------------------
 class HippocampusAgent:
@@ -264,15 +291,19 @@ class HippocampusAgent:
                  verbose: bool = False):
         assert env.flat_actions, "agent supports flat actions only"
         self.env = env
-        self.device = device or (torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu"))
+        # 核心改动2：使用新的设备选择逻辑，优先cuda:1
+        self.device = get_target_device(device) if device is None else device
         self.verbose = verbose
 
-        # GPU优化配置
-        if torch.cuda.is_available():
+        # GPU优化配置（绑定到目标设备）
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)  # 设为当前线程默认GPU
             torch.backends.cudnn.benchmark = True
-            self.stream = torch.cuda.Stream()
+            self.stream = torch.cuda.Stream(device=self.device)
+        else:
+            self.stream = None
 
-        # 固定随机种子
+        # 固定随机种子（按设备适配）
         self.seed = seed
         random.seed(self.seed)
         np.random.seed(self.seed)
@@ -303,18 +334,18 @@ class HippocampusAgent:
         self.ca3 = CA3Memory(feat_dim, rnn_hidden, rnn_type, num_layers=rnn_layers, dropout=0.0)
         self.ca1 = CA1ValueHead(rnn_hidden, list(hidden_sizes), env.action_space.n)
 
-        # 目标网络
+        # 目标网络（强制移到目标设备）
         self.target_ca1 = CA1ValueHead(rnn_hidden, list(hidden_sizes), env.action_space.n)
         self.target_ca1.load_state_dict(self.ca1.state_dict())
         self.target_ca1.to(self.device)
         self.target_ca1.eval()
 
-        # 移到GPU
+        # 移到目标GPU（显式指定设备）
         self.dg.to(self.device)
         self.ca3.to(self.device)
         self.ca1.to(self.device)
 
-        # 经验回放池
+        # 经验回放池（绑定目标设备）
         self.replay = ReplayBuffer(replay_size, seq_len, feat_dim, self.device)
 
         # 超参数
@@ -336,8 +367,14 @@ class HippocampusAgent:
         # 优化器
         self.optimizer = optim.Adam(
             list(self.dg.parameters()) + list(self.ca3.parameters()) + list(self.ca1.parameters()),
-            lr=lr, weight_decay=1e-5
+            lr=lr, weight_decay=1e-5, betas=(0.9, 0.999), eps=1e-8
         )
+        # 权重初始化
+        for m in list(self.dg.modules()) + list(self.ca3.modules()) + list(self.ca1.modules()):
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
         self.loss_fn = nn.SmoothL1Loss()
 
         # 训练状态记录
@@ -347,45 +384,60 @@ class HippocampusAgent:
 
     # epsilon衰减策略
     def epsilon(self):
-        return self.final_epsilon + (1.0 - self.final_epsilon) * np.exp(-self.steps_done / max(1, self.eps_decay))
+        # 更慢的线性衰减，防止过早收敛
+        decay = min(1.0, self.steps_done / max(1, self.eps_decay))
+        return (1.0 - decay) * 1.0 + decay * self.final_epsilon
 
-    # 编码观测
+    # 编码观测（强制使用目标设备）
     def encode_obs(self, obs):
         data = obs_to_data_gpu(obs, self.env.network, self.device)
         flat, glob = self.dg(data)
         return flat
 
-    # 单步优化
+    # 单步优化（适配目标设备的CUDA流）
     def optimize_step(self):
         batch = self.replay.sample(self.batch)
         if batch is None:
             return 0.0, 0.0
         s, a, ns, r, d = batch
 
-        with torch.cuda.stream(self.stream):
-            # RNN前向传播
-            rnn_out, _ = self.ca3(s)
-            q_vals = self.ca1(rnn_out[:, -1, :])
-            q = q_vals.gather(1, a).squeeze(1)
+        # 奖励归一化/裁剪
+        r = torch.clamp(r, -10.0, 10.0)
 
-            with torch.no_grad():
-                rnn_ns, _ = self.ca3(ns)
-                next_q_vals = self.target_ca1(rnn_ns[:, -1, :])
-                next_q = next_q_vals.max(1)[0]
-                target = r + self.gamma * (1.0 - d) * next_q
+        # 适配目标设备的CUDA流
+        if self.stream is not None:
+            with torch.cuda.stream(self.stream):
+                return self._compute_optimization(s, a, ns, r, d)
+        else:
+            # CPU场景直接计算
+            return self._compute_optimization(s, a, ns, r, d)
 
-            loss = self.loss_fn(q, target)
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(self.dg.parameters()) + list(self.ca3.parameters()) + list(self.ca1.parameters()),
-                max_norm=2.0
-            )
-            self.optimizer.step()
+    # 拆分优化计算逻辑（便于设备适配）
+    def _compute_optimization(self, s, a, ns, r, d):
+        # RNN前向传播（已在目标设备）
+        rnn_out, _ = self.ca3(s)
+        q_vals = self.ca1(rnn_out[:, -1, :])
+        q = q_vals.gather(1, a).squeeze(1)
 
-            # 定期更新目标网络
-            if self.steps_done % self.target_update_interval == 0:
-                self.target_ca1.load_state_dict(self.ca1.state_dict())
+        with torch.no_grad():
+            rnn_ns, _ = self.ca3(ns)
+            next_q_vals = self.target_ca1(rnn_ns[:, -1, :])
+            next_q = next_q_vals.max(1)[0]
+            target = r + self.gamma * (1.0 - d) * next_q
+
+        loss = self.loss_fn(q, target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        # 更严格的梯度裁剪
+        torch.nn.utils.clip_grad_norm_(
+            list(self.dg.parameters()) + list(self.ca3.parameters()) + list(self.ca1.parameters()),
+            max_norm=1.0
+        )
+        self.optimizer.step()
+
+        # 定期更新目标网络
+        if self.steps_done % self.target_update_interval == 0:
+            self.target_ca1.load_state_dict(self.ca1.state_dict())
 
         q_mean = q_vals.max(1)[0].mean().item()
         return loss.item(), q_mean
@@ -409,7 +461,7 @@ class HippocampusAgent:
 
         # 单episode训练循环
         while not done and steps < max_steps_per_episode and self.steps_done < self.training_steps:
-            # 1. 编码当前观测
+            # 1. 编码当前观测（目标设备）
             emb = self.encode_obs(obs).detach().cpu().numpy()
             seq.append(emb)
             if len(seq) > self.seq_len:
@@ -450,8 +502,10 @@ class HippocampusAgent:
             # 成功奖励
             if self.env.goal_reached():
                 reward += self.success_bonus
+            # 奖励裁剪，防止极端值影响训练
+            reward = max(min(reward, 10.0), -10.0)
 
-            # 5. 编码下一个观测
+            # 5. 编码下一个观测（目标设备）
             emb2 = self.encode_obs(next_obs).detach().cpu().numpy()
             seq2 = seq.copy()
             seq2.append(emb2)
@@ -461,7 +515,7 @@ class HippocampusAgent:
             ns_np = np.zeros((self.seq_len, emb2.shape[0]), dtype=np.float32)
             ns_np[-len(seq2):] = np.stack(seq2, axis=0)
 
-            # 6. 存储经验
+            # 6. 存储经验（目标设备）
             self.replay.store(s_np, a, ns_np, reward, float(done))
 
             # 7. 优化（预热后）
@@ -492,13 +546,13 @@ class HippocampusAgent:
             seq = []
 
             while not done and steps < max_steps_per_episode:
-                # 编码观测
+                # 编码观测（目标设备）
                 emb = self.encode_obs(obs).detach()
                 seq.append(emb.cpu().numpy())
                 if len(seq) > self.seq_len:
                     seq.pop(0)
 
-                # 构造序列输入
+                # 构造序列输入（目标设备）
                 padded = np.zeros((self.seq_len, emb.numel()), dtype=np.float32)
                 padded[-len(seq):] = np.stack(seq[-self.seq_len:], axis=0)
                 s_tensor = torch.tensor(padded, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -539,7 +593,7 @@ def main():
     parser.add_argument("--seq-len", type=int, default=6, help="Sequence length for RNN")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
-    parser.add_argument("--device", type=str, default=None, help="Device (e.g., cuda:0/cpu)")
+    parser.add_argument("--device", type=str, default=None, help="Device (e.g., cuda:1/cpu)")  # 支持手动指定cuda:1
     args = parser.parse_args()
 
     # 创建NASim环境
@@ -551,10 +605,8 @@ def main():
         flat_obs=False
     )
 
-    # 确定运行设备
-    device = torch.device(args.device) if args.device else (
-        torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-    )
+    # 确定运行设备（优先手动指定，否则自动选cuda:1）
+    device = get_target_device(args.device)
 
     # 根据环境自动适配奖励参数
     env_reward_config = {
@@ -573,7 +625,7 @@ def main():
         batch_size=args.batch_size,
         seq_len=args.seq_len,
         seed=args.seed,
-        device=device,
+        device=device,  # 传入目标设备（cuda:1）
         verbose=args.verbose,
         # 环境专属奖励参数
         success_bonus=reward_config["success_bonus"],
@@ -604,7 +656,8 @@ def main():
                     "ep": agent.episodes,
                     "ret": f"{ep_ret:.2f}",
                     "goal": int(goal),
-                    "eps": f"{agent.epsilon():.3f}"
+                    "eps": f"{agent.epsilon():.3f}",
+                    "device": str(device)  # 新增：显示当前设备
                 })
         
         pbar.close()
@@ -619,6 +672,7 @@ def main():
         print(f"Mean Return: {np.mean(eval_stats['returns']):.2f}")
         print(f"Success Rate: {np.mean(eval_stats['goals']):.2f}")
         print(f"Mean Steps per Episode: {np.mean(eval_stats['steps']):.2f}")
+        print(f"[INFO] Training completed on device: {device}")  # 确认设备
         
     except ImportError:
         # 无tqdm时的简易训练
@@ -626,13 +680,14 @@ def main():
         while agent.steps_done < args.training_steps:
             ep_ret, ep_steps, goal = agent.run_train_episode()
             if args.verbose and agent.episodes % 10 == 0:
-                print(f"Ep {agent.episodes}: Ret={ep_ret:.2f}, Steps={ep_steps}, Goal={int(goal)}")
+                print(f"Ep {agent.episodes}: Ret={ep_ret:.2f}, Steps={ep_steps}, Goal={int(goal)}, Device={device}")
         
         # 评估
         eval_stats = agent.evaluate(n_episodes=30)
         print("\n[Final Evaluation Results]")
         print(f"Mean Return: {np.mean(eval_stats['returns']):.2f}")
         print(f"Success Rate: {np.mean(eval_stats['goals']):.2f}")
+        print(f"[INFO] Training completed on device: {device}")
 
 if __name__ == "__main__":
     main()
